@@ -1,0 +1,465 @@
+---
+title: "Choose Your Own Project Submission"
+author: "Juan Carlos Cortez Villarreal"
+params:
+  eval: TRUE
+  include: TRUE
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, eval=params$eval}
+knitr::opts_chunk$set(echo = TRUE)
+
+#loading libraries
+if(!require(stringi)) install.packages("stringi")
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org", dependencies=TRUE)
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org", dependencies=TRUE)
+if(!require(data.table)) install.packages("data.table")
+if(!require(recommenderlab)) install.packages("recommenderlab")
+```
+
+## Preface
+
+This is my submission for the last part of the Data Science: Capstone! course provided by HarvardX in association with edX.org. The objective is to choose a database, apply datasciense analysis and report the findings.
+
+## 1. Introduction
+
+Let's stick with recommendation systems. This time we will use information from Last.fm Online Music System. This data was retrieved and formatted by the Information Retrieval group at Universidad Autonoma de Madrid for HetRec 2011 <https://grouplens.org/datasets/hetrec-2011/>
+
+The reason to choose recommendation systems again and this database in particular is twofold:
+
+* I don't want to drift too much apart from something that could be followed and understood quickly in the context of the course.
+* I enjoy music very much, and this database is, in fact, the one that caught my eye the most.
+
+A specific thought got stuck in my mind: In addition to getting an estimation and measuring it, could I get the data to actually suggest me some interesting music?
+
+## 2. Analysis
+
+The dataset contains information about friendship between users, user-defined tagging, and the listening habits of close to 2k users on artist level.
+
+Other databases for song level prediction are available, for example: <https://www.dtic.upf.edu/~ocelma/MusicRecommendationDataset/lastfm-1K.html> but our database is bigger, newer and has more variables. We'll leave song level prediction for future work.
+
+We will only focus on the play count for our first analysis.
+
+### 2.1. Data Exploration
+
+The user_artist.dat file contains [userID, artistID] keys with a weight parameter that represent the amount of times the user has played that artist.
+
+The artist.dat file contains the ids, names, URL and image URL of each of the artists associated with the dataset.
+
+```{r eval=params$eval, include=params$include}
+dl1 <- tempfile()
+download.file("https://raw.githubusercontent.com/ciberneuro/dsLastFM/master/data/user_artists.dat", dl1)
+plays <- fread(text = readLines(dl1), header = TRUE)
+dl2 <- tempfile()
+download.file("https://raw.githubusercontent.com/ciberneuro/dsLastFM/master/data/artists.dat", dl2)
+artists <- fread(text = readLines(dl2), header = TRUE,
+                 quote="", drop=c("url", "pictureURL"),
+                 col.names = c("artistID", "artistName"))
+rm(dl1, dl2)
+artists$artistName <- stri_trans_general(artists$artistName, "Any-Latin")
+print(paste("The dataset has", dim(plays)[1], "rows and", dim(plays)[2], "columns."))
+print(paste("The columns names are: ", toString(colnames(plays))))
+```
+
+#### 2.1.1. Dealing with outliers
+We can see a histogram of the number of plays
+```{r eval=params$eval, include=params$include}
+hist(plays$weight, main="Histogram of number of plays")
+writeLines(paste("The plays have an average of", mean(plays$weight),
+                 "\nwith a median of", median(plays$weight),
+                 "\nand a maximum of", max(plays$weight)))
+```
+
+And notice that the median is less than half the average. This is because we have a very low number of really high values that skew the results.
+
+```{r eval=params$eval, include=params$include}
+outlier_limit <- boxplot.stats(plays$weight)$stats[5]
+writeLines(paste("The statistical process that R uses for plotting,",
+                 "\ndefines the outliers as the numbers above", outlier_limit))
+```
+There are many ways to deal with outliers. So let's see this as a movie recommendation system, but rather than 1 to 5, let's assume a 1 to 1000 scale. The only significant difference in modeling this way is that in movies a 1 star score can be considered bad, but any number in this case should be considered a positive.
+
+So let's just set anything above 1000 as 1000
+```{r eval=params$eval, include=params$include}
+plays$weight[plays$weight>1000] <- 1000
+```
+
+The 1000 might seem somewhat arbitrary, but when we apply a cutoff of 1374, we still get outliers of that new dataset. Instead of multiple executions or a more complex formula, let's just simplify it.
+
+Another possible approach would be to normalize based on user. Meaning dividing all numbers by the user's average. However, that seems to punish high number of plays in users with very high numbers by comparison. This particular phase is the outlier handling, the algorithms will normalize in their own way.
+
+#### 2.1.2. About the artists
+
+```{r eval=params$eval, include=params$include}
+artist_plays <- plays %>% 
+  group_by(artistID) %>% 
+  summarize(n=n(), weight = mean(weight)) %>%
+  left_join(artists, by="artistID")
+artist_plays %>% arrange(desc(weight)) %>% top_n(10,weight)
+```
+When we look at the top listened artist by average weight, we find that there is a really high number of 1 user artists.
+
+We have been taught that the algorithms should be able to account for low values by assigning them a penalty. However, the algorithms don't seem able to cope with such high quantity of these individual cases. Added to the fact that we want to receive suggestions from relatively popular bands, we filter them now.
+
+```{r eval=params$eval, include=params$include}
+plays <- plays %>% 
+  semi_join(artist_plays %>% filter(n>=25), by="artistID")
+```
+
+We limit the database to artists with 25 or more users because when we observe the data, 25 seems to be a small enough number to generate popular artists.
+
+```{r eval=params$eval, include=params$include}
+artist_plays <- plays %>% 
+  group_by(artistID) %>% 
+  summarize(n=n(), weight = mean(weight)) %>%
+  left_join(artists, by="artistID")
+artist_plays %>% arrange(desc(weight)) %>% top_n(10,weight)
+```
+
+### 2.2. Data Exploration of new dataset
+
+The new dataset, filtered and bounded, now has the following characteristics:
+```{r eval=params$eval, include=params$include}
+print(paste("The dataset has", dim(plays)[1], "rows and", dim(plays)[2], "columns."))
+print(paste("The columns names are: ", toString(colnames(plays))))
+```
+
+#### 2.2.1. About the users
+```{r eval=params$eval, include=params$include}
+print(paste("There are", length(unique(plays$userID)), "unique users"))
+user_plays <- plays %>% group_by(userID) %>% summarize(n=n(), w = sum(weight))
+hist(user_plays$n, main ="Histogram of number of artists played per user")
+writeLines(paste("The average number of artists played by a user is",
+                 mean(user_plays$n)))
+hist(user_plays$w , main="Histogram of number of plays per user")
+writeLines(paste("Users have played an average of", mean(user_plays$w), "songs,",
+            "\nwith a median of", median(user_plays$w),
+            "\nand a maximum of", max(user_plays$w)
+           ))
+```
+
+#### 2.2.2. About the artists
+
+```{r eval=params$eval, include=params$include}
+print(paste("There are", length(unique(plays$artistID)), "unique artists."))
+writeLines(paste("The average artist is listened ", mean(artist_plays$weight),
+                 "times\nby", mean(artist_plays$n), "users." ))
+```
+
+## 3. Method
+
+### 3.1. First idea: Penalized Least Square method
+Let's first analyze the Penalized Least Square method. This method is based on the idea that a particular user produces an effect or bias on the score prediction (number of plays in this case) based on the fact that not everyone plays the same amount of music. Also, a particular artist will add an effect or bias based on the fact that they are more liked than others.
+
+We penalize values outside the mean that are estimated by one or too few samples in order to lower their uncertainty. And in the end we have to minimize the following equation:
+
+$$\frac{1}{N} \sum_{u,i} \left(y_{u,i} - \mu - b_i - b_u \right)^2 + 
+\lambda \left(\sum_{i} b_i^2 + \sum_{u} b_u^2\right)$$
+
+where  
+  $y_{u,i}$ is our estimation of plays from user u to artist i  
+  $\mu$ is the average number of plays of the dataset
+  $b_i$ is the artist effect or bias  
+  $b_u$ is the user effect or bias  
+  $\lambda$ is the penalty factor  
+
+#### 3.1.2. Partition the data
+
+```{r eval=params$eval, include=params$include}
+set.seed(1)
+test_index <- createDataPartition(y = plays$weight, times = 1, p = 0.1, list = FALSE)
+trainx <- plays[-test_index,]
+temp <- plays[test_index,]
+
+validation <- temp %>% 
+  semi_join(trainx, by = "artistID") %>%
+  semi_join(trainx, by = "userID")
+
+removed <- anti_join(temp, validation)
+trainx <- rbind(trainx, removed)
+rm(test_index, temp, removed)
+```
+
+#### 3.1.3. Add extra test data
+Our initial premise was to look for interesting suggestions that are in tune with a particular musical taste. In order to do that, we add 4 test records to the training set: a user 9999 that has played Block Party, Incubus, Red Hot Chili Peppers and Arctic Monkeys in equal amount.
+```{r eval=params$eval, include=params$include}
+trainx <- rbind(trainx, data.frame(
+  userID = c(9999, 9999, 9999, 9999),
+  artistID = c(210, 1116, 220, 207),
+  weight = c(1000, 1000, 1000, 1000)
+))
+```
+
+#### 3.1.4. Optimize the lambda 
+```{r eval=params$eval, include=params$include}
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+  
+  mu <- mean(trainx$weight)
+  
+  b_i <- trainx %>% 
+    group_by(artistID) %>%
+    summarize(b_i = sum(weight - mu)/(n()+l))
+  
+  b_u <- trainx %>% 
+    left_join(b_i, by="artistID") %>%
+    group_by(userID) %>%
+    summarize(b_u = sum(weight - b_i - mu)/(n()+l))
+  
+  predicted_values <- 
+    trainx %>% 
+    left_join(b_i, by = "artistID") %>%
+    left_join(b_u, by = "userID") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+  
+  return(RMSE(predicted_values, trainx$weight))
+})
+qplot(lambdas, rmses)
+print(paste("Lambda", lambdas[which.min(rmses)], "offers the lowest RMSE."))
+```
+
+#### 3.1.5. Validate the RMSE
+To test our algorithm, we use the RMSE
+```{r eval=params$eval, include=params$include}
+lambda <- 0.25
+mu <- mean(trainx$weight)
+
+b_i <- trainx %>% 
+  group_by(artistID) %>%
+  summarize(b_i = sum(weight - mu)/(n()+lambda))
+
+b_u <- trainx %>% 
+  left_join(b_i, by="artistID") %>%
+  group_by(userID) %>%
+  summarize(b_u = sum(weight - b_i - mu)/(n()+lambda))
+
+predicted_values <- 
+  validation %>% 
+  left_join(b_i, by = "artistID") %>%
+  left_join(b_u, by = "userID") %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+validation_RMSE <- RMSE(predicted_values, validation$weight)
+print(paste("Our algorithm has a RMSE of", validation_RMSE))
+```
+
+An RMSE of 246 means that our predictions of number of plays typically has an error of 246. This is not necessarily a bad thing since, in practice, what we want is not the number but an order of preference for a particular user.
+
+#### 3.1.5. Making Predictions
+We can now predict the number of plays a user will have on the artists and sort it from highest to lowest.
+
+```{r eval=params$eval, include=params$include}
+suggestions <- merge(data.frame(userID = 9999), artists, all=TRUE) %>%
+  left_join(b_i, by = "artistID") %>%
+  left_join(b_u, by = "userID") %>%
+  semi_join(trainx, by = "artistID") %>%
+  mutate(pred = mu + b_i + b_u, artistName = stringr::str_trunc(artistName, 40))
+suggestions %>%
+  select(artistID, artistName, pred) %>%
+  arrange(desc(pred)) %>% top_n(10, pred)
+```
+
+Finally, we see that although our estimated RSME isn't abysmal, our algorithm would produce the same popular recommendations to every single user. This is because, although we account for user bias, we don't account for tendencies and tastes within groups of people. An easy way to understand the simplistic approach to user bias is to change the b_u and see the results.
+
+```{r eval=params$eval, include=params$include}
+suggestions <- merge(data.frame(userID = 9999), artists, all=TRUE) %>%
+  left_join(b_i, by = "artistID") %>%
+  semi_join(trainx, by = "artistID") %>%
+  mutate(pred = mu + b_i + 1, artistName = stringr::str_trunc(artistName, 40))
+suggestions %>%
+  select(artistID, artistName, pred) %>%
+  arrange(desc(pred)) %>% top_n(10, pred)
+```
+
+In our new test, we change our b_u to 1, and got different prediction values, but the same artists as the difference between them stays proportional.
+
+In order to account for similar user tendencies, we need a different approach.
+
+### 3.2. Collaborative Filtering
+
+We are working with the assumption that if a user has played music from a specific artist it is because they like it. So the similarities in listening habits allow us to assume similar taste in music. Let's say our data shows that user A listens to music from artists P, Q and R, and user B listens to music from artists P, Q, R and Z. Then it is likely that user A might also enjoy artist Z. 
+
+This approach to the recommendation system is called User Based Collaborative Filtering (UBCF). The algorithm's goal is to search the data for similarities to the target user, then calculate the closest matches, these are called nearest neighbors, and use their results to weight the predictions.
+
+R offers easy access to a series of classes and methods to work with UBCF and other algorithms in the form of the recommenderlab package.
+
+#### 3.2.1 Preparing the data
+Let's add the users 9998 and 9999 to our plays dataset.
+
+User 9998 likes The Eagles, The Beatles and Led Zepellin.
+User 9999 likes Bloc Party, Incubus, Red Hot Chili Peppers and Arctic Monkeys.
+
+```{r eval=params$eval, include=params$include}
+plays <- rbind(plays, data.frame(
+  userID = c(9998, 9998, 9998),
+  artistID = c(730, 227, 1242),
+  weight = c(1000, 1000, 1000)
+))
+plays <- rbind(plays, data.frame(
+  userID = c(9999, 9999, 9999, 9999),
+  artistID = c(210, 1116, 220, 207),
+  weight = c(1000, 1000, 1000, 1000)
+))
+```
+*Note: if you are checking the code, it would be interesting for you to change user 9998 to your particular taste and see the results*
+
+In order to work with the Recommenderlab framework, we need to transform the data.frame to a realRatingMatrix class
+
+```{r eval=params$eval, include=params$include}
+rrm <- as(plays,"realRatingMatrix")
+rrm
+```
+
+#### 3.2.2 Validating the algorithm
+
+Instead of manually setting a train and test sets, the Recommenderlab framework allows us to setup an evaluationScheme and evaluation classes that do the partition and testing.
+
+
+```{r eval=params$eval, include=params$include}
+srrm <- rrm[rowCounts(rrm) >= 5,]
+es <- evaluationScheme(srrm, method="split", train=0.9, given=3, goodRating=0.001)
+ev <- evaluate(es, "UBCF", parameter = list(nn=750), type="ratings", 
+               n=10, progress=FALSE)
+avg(ev)
+```
+
+Our RMSE is worst! Have we failed?
+
+#### 3.2.3 Looking at the results
+
+Let's look at the actual suggestions from the algorithm
+```{r eval=params$eval, include=params$include}
+rec <- Recommender(rrm, method = "UBCF", parameter = list(nn=750))
+pre <- predict(rec, rrm["9999"], n=10)
+data.frame(artistID = as.integer(as(pre, "list")[[1]])) %>% 
+  left_join (artists, by="artistID")
+```
+In the results section there will be a more detailed explanation, but the conclusion is that these are very good recommendations.
+
+Let's see the suggestions for user 9998
+```{r eval=params$eval, include=params$include}
+pre <- predict(rec, rrm["9998"], n=10)
+data.frame(artistID = as.integer(as(pre, "list")[[1]])) %>% 
+  left_join (artists, by="artistID")
+```
+There are some similarities, but the differences account for the user's taste in music.
+
+So what Happened? Why is it that a higher RMSE gives such better results?
+The RMSE is a value that calculates the typical mistake when performing a prediction, doesn't matter if it's positive or negative, also it doesn't really have to be special for each user, an average could, as we saw, produce a better RMSE. So maybe the RMSE is not a good indicator, or maybe it's incomplete.
+
+Let's look at other statistical measures.
+
+#### 3.2.4 Statistical measures
+
+When evaluating an algorithm, other very important statistical measures are the sensitivity and specificity. Those two are based on the four key statistics: True Positive (TP), False Positive (FP), False Negative (FN), True Negative (TN).
+
+By looking at these statistics we can analyze how they are important for our specific goal:
+
+* True Positives: a true positive is a correct suggestion, we should maximize this. 
+* False Positives: a false positive might lead to a bad suggestion, but if you think about it, because of people's music listening habits, there might be a lot of good suggestions that would read as false positives, since they are not in their playlists.
+* False Negatives: a false negative would deny us of a meaningful suggestion, we should minimize this.
+* True Negatives: A true negative allows us to discard a suggestion as useful, without them every artist would be suggested. However, we cannot maximize this since it would also increase the false negatives, denying the user from any suggestion.
+
+In a somewhat related note. Something that may have gone unnoticed if the reader is not paying close attention to the code is that there is a hard coded parameter called nn, set at 750. Let's run a series of nn's and see our statistics.
+
+```{r eval=params$eval, include=params$include}
+nns <- seq(50, 1000, 50)
+statx <- sapply(nns, function(nnx){
+  ev <- evaluate(es, "UBCF", parameter = list(nn=nnx), n=10,
+                 progress = FALSE)
+  return(avg(ev))
+})
+qplot(nns, statx[1,], main="True Positives") #TP
+qplot(nns, statx[2,], main="False Positives") #FP
+qplot(nns, statx[3,], main="False Negatives") #FN
+qplot(nns, statx[4,], main="True Negatives") #TN
+qplot(nns, statx[5,], main="Precision") #precision
+qplot(nns, statx[6,], main="Recall") #recall
+qplot(nns, statx[7,], main="TPR") #TPR
+qplot(nns, statx[8,], main="FPR") #FPR
+
+plot(nns, statx[1,])
+par(new=TRUE)
+plot(nns, statx[4,],col="green")
+```
+In this chart, we see the true positives go down as the true negatives go up. They balance each other at close to 500.
+
+When we analyze the suggestions, we get that values lower than 500 tend to be more general and make popular suggestions, while values higher than 500 are more specific but more prone to false negatives.
+
+Let's run the comparison with nn=300
+```{r eval=params$eval, include=params$include}
+rec <- Recommender(rrm, method = "UBCF", parameter = list(nn=300))
+pre <- predict(rec, rrm["9999"], n=10)
+data.frame(artistID = as.integer(as(pre, "list")[[1]])) %>% 
+  left_join (artists, by="artistID")
+pre <- predict(rec, rrm["9998"], n=10)
+data.frame(artistID = as.integer(as(pre, "list")[[1]])) %>% 
+  left_join (artists, by="artistID")
+```
+Both datasets are the same and not that specific to their particular taste.
+
+## 4. Results
+
+Since the nn parameter actually changes from user to user, I decided to create a function to get suggestions for a specific user, by maximizing the nn until before you get no results.
+
+```{r eval=params$eval, include=params$include}
+get_suggestions <- function(id) {
+  nnx = 400
+  resp = NULL
+  while (nnx<2000) {
+    rec <- Recommender(rrm, method = "UBCF", parameter = list(nn=nnx))
+    pre <- predict(rec, rrm[ toString(id) ], n=10)
+    if (length(as(pre, "list")[[1]])<10 || nnx>=1950){
+      return(data.frame(artistID = as.integer(as(resp, "list")[[1]])) %>% 
+        left_join (artists, by="artistID"))
+    } else {
+      resp = pre
+    }
+    nnx=nnx+50
+  }
+}
+get_suggestions(9999)
+```
+Bright Eyes was a bit too slow for my taste, but not that far off. Jack's Mannequin has a pop/rock angsty tone that reminds me of the songs I listened in the 2000s. Black Rebel Motorcycle Club has that indie rock feel that I really enjoy. The last Shadow Puppets is a rock duo from the lead singer of Arctic Monkeys.
+
+These suggestions are awesome!
+
+```{r eval=params$eval, include=params$include}
+get_suggestions(9998)
+```
+
+There is some overlap, but we can account for that considering that there is a soft rock vibe going through both of them. The interesting thing to notice is that the differences strongly suggest better suggestions to account for this user's taste in music, like how the members of the Beatles are there.
+
+These suggestions rock too!
+
+## 5. Conclusions
+
+We started this project with the objective of getting suggestions for music related to my particular taste and the objective was accomplished both in theory but also by actually looking up the bands and enjoying their music.
+
+Future work:
+
+* The original dataset used for this work contains information related to user defined tags and friendships between users. That information clearly defines similarities between artists and between users respectively. Used properly it should allow a much more precise algorithm.
+
+* The original Last.fm database provides an API to get the information. It is where the dataset originally came from and could be used to get much more detailed and bigger dataset.
+
+* In relation to the previous observation. One of the biggest improvements would be to work on a song level rather than an artist level. There has been work in that area and there is a database of similarities between songs. http://millionsongdataset.com/lastfm/
+
+* The Recommenderlab framework has implemented several other algorithms that could improve on the solution, for example, the Item Based Collaborative Filtering (IBCF), that works on similarities, like UBCF, but not between users, but in this case, between artists. This is particularly powerful when we consider that Recommenderlab also allows for Hybrid solutions that mix multiple algorithms to give one weighted result.
+
+## 6. Bibliography
+
+* Irizarry, Rafael A. “Data Analysis and Prediction Algorithms with R.” Introduction to Data Science, 22 Apr. 2019, rafalab.github.io/dsbook/.  
+* Hahsler, Michael. Recommenderlab: A Framework for Developing and Testing Recommendation Algorithms.  
+* Luo, Shuyu. “Intro to Recommender System: Collaborative Filtering.” Towards Data Science, Towards Data Science, 10 Dec. 2018, towardsdatascience.com/intro-to-recommender-system-collaborative-filtering-64a238194a26. Accessed 17 June 2019.  
+* Pinela, Carlos. “Recommender Systems — User-Based and Item-Based Collaborative Filtering.” Medium, Medium, 6 Nov. 2017, medium.com/@cfpinela/recommender-systems-user-based-and-item-based- collaborative-filtering-5d5f375a127f. Accessed 17 June 2019.  
+
+## Version
+This document was created using R
+```{r eval=params$eval, include=params$include}
+version
+```
